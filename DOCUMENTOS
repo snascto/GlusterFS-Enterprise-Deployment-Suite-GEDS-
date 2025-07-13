@@ -1,1 +1,216 @@
 
+# Changelog
+
+## [4.0.0] - 2023-11-20
+
+### Adicionado
+- Suporte completo a configuração de arbitro
+- Integração com Telegraf para monitoramento
+- Novas opções de otimização de performance
+
+### Alterado
+- Refatoração completa do sistema de logging
+- Melhor tratamento de erros
+
+### Removido
+- Suporte a Ubuntu 18.04 (EOL)
+
+## [3.2.1] - 2023-09-15
+- Correções de segurança
+- Atualização de dependências
+
+# Design Arquitetural
+
+## Diagrama de Componentes
+
+```mermaid
+graph TD
+    A[Clientes] --> B[Load Balancer]
+    B --> C[Nó Primário]
+    B --> D[Nó Secundário]
+    C --> E[Arbitro]
+    D --> E
+    C --> F[Monitoramento]
+
+Documentação Técnica Completa
+1. Visão Geral
+O GlusterFS Enterprise Deployment Suite (GEDS) é uma solução completa para implementação de clusters GlusterFS em ambientes críticos, com:
+
+Configuração automatizada de nós (dados e arbitro)
+
+Hardening de segurança conforme padrões CIS
+
+Otimizações de performance para cargas pesadas
+
+Monitoramento integrado
+
+Geração de relatórios de auditoria detalhados
+
+2. Fluxo de Implementação
+Fase 1: Pré-requisitos
+Verificação de Hardware:
+
+Mínimo 8 cores CPU
+
+16GB RAM
+
+2+ discos disponíveis
+
+Verificação de Rede:
+
+Interface 10Gbps recomendada
+
+Conectividade entre nós
+
+Fase 2: Configuração Base
+Atualizações de segurança
+
+Instalação de pacotes específicos:
+
+glusterfs-server (versão controlada)
+
+xfsprogs (para formatação XFS)
+
+ferramentas de monitoramento
+
+Ajustes de kernel para performance
+
+Fase 3: Armazenamento
+Opções:
+
+Automática:
+
+Detecção de discos não utilizados
+
+Particionamento GPT com alinhamento ótimo
+
+Formatação XFS com parâmetros otimizados:
+
+inode64 para sistemas grandes
+
+logbsize=256k para melhor performance
+
+Manual:
+
+Controle total sobre layout de discos
+
+Opção para configuração de RAID
+
+Fase 4: Rede
+Configuração de bonding LACP (802.3ad)
+
+VLAN dedicada para tráfego do cluster
+
+QoS para priorização de tráfego Gluster
+
+Jumbo frames (MTU 9000)
+
+Fase 5: Cluster
+Tipos de Nó:
+
+Primário:
+
+Inicia o cluster
+
+Configura volumes
+
+Adiciona nós secundários
+
+Secundário:
+
+Adicionado via peer probe
+
+Configuração automática de bricks
+
+Arbitro:
+
+Configuração mínima
+
+Armazena apenas metadados
+
+Garante quorum
+
+Fase 6: Segurança
+Firewall baseado em zonas
+
+Certificados TLS para comunicação
+
+ACLs restritivas para bricks
+
+Criptografia de dados em trânsito
+
+Fase 7: Monitoramento
+Coleta de métricas via Telegraf
+
+Exportação para InfluxDB/Grafana
+
+Log rotation configurado
+
+Alertas para eventos críticos
+
+3. Matriz de Decisão para Configuração
+Cenário	Configuração Recomendada	Parâmetros Chave
+Alta disponibilidade	Replica 3 (2+1 arbitro)	quorum-type=auto
+Máximo desempenho	Distributed + client-io-threads	performance.cache-size=4GB
+Balanceado	Disperse 6+2	disperse-data=6, redundancy=2
+Dados críticos	Replica 3 + geo-replication	cluster.granular-entry-heal=on
+4. Validação Pós-Implantação
+Testes Obrigatórios:
+
+bash
+# Verificação básica
+gluster volume status all
+gluster volume heal VOLNAME info
+
+# Teste de performance
+fio --name=gluster-test --ioengine=libaio --rw=randrw --bs=4k \
+    --direct=1 --numjobs=16 --size=1G --runtime=60 --group_reporting
+Monitoramento Contínuo:
+
+Latência entre nós
+
+Utilização de recursos
+
+Integridade dos bricks
+
+Status do quorum
+
+5. Procedimentos de Emergência
+Split-Brain Resolution:
+
+bash
+gluster volume heal VOLNAME full
+gluster volume reset VOLNAME split-brain
+Recuperação de Nó:
+
+Verificar logs em /var/log/glusterfs
+
+Reiniciar serviço glusterd
+
+Se necessário, recriar brick e adicionar ao volume
+
+6. Documentação Complementar
+Estrutura de Diretórios:
+
+text
+/gluster/
+├── brick_sda/    # Brick 1
+├── brick_sdb/    # Brick 2
+└── brick_nvme/   # Brick SSD
+Arquivos de Configuração:
+
+/etc/glusterfs/glusterd.vol - Configuração do daemon
+
+/var/lib/glusterd/ - Metadados do cluster
+
+/etc/ssl/gluster.* - Certificados TLS
+
+7. Referências Técnicas
+GlusterFS Documentation
+
+CIS Ubuntu Benchmark
+
+NIST SP 800-184
+
+Este script e documentação representam a solução definitiva para implementação enterprise de clusters GlusterFS, atendendo aos mais rigorosos requisitos de TI, Engenharia e Auditoria.
+
