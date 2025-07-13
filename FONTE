@@ -1,0 +1,530 @@
+#!/bin/bash
+# Título: GlusterFS Enterprise Deployment Suite - GEDS
+# Versão: 4.0
+# Data: $(date +"%Y-%m-%d")
+# Autor: Equipe de Engenharia de Infraestrutura
+# Licença: GNU GPLv3+
+# Finalidade: Implementação completa de cluster GlusterFS com arbitro para ambientes críticos
+# Documentação: https://docs.gluster.org/en/latest/
+
+## Seção 1: Configurações Globais e Inicialização
+# ==============================================
+
+# Configuração de auditoria
+AUDIT_LOG="/var/log/gluster_audit_$(date +%Y%m%d%H%M%S).log"
+AUDIT_TMP="/tmp/gluster_audit.tmp"
+exec > >(tee -a "$AUDIT_LOG") 2>&1
+
+# Funções de logging avançadas
+log() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date --iso-8601=seconds)
+    
+    case $level in
+        "INFO") color="\033[34m" ;;
+        "SUCCESS") color="\033[32m" ;;
+        "WARNING") color="\033[33m" ;;
+        "ERROR") color="\033[31m" ;;
+        *) color="\033[0m" ;;
+    esac
+    
+    echo -e "${color}[${timestamp}] [${level}] ${message}\033[0m" | tee -a "$AUDIT_TMP"
+    logger -t "GEDS" -p user.$level "$message"
+}
+
+# Verificação de ambiente
+verify_environment() {
+    log "INFO" "Iniciando verificação de ambiente"
+    
+    # 1. Verificação de sistema operacional
+    if ! grep -q 'Ubuntu 22.04' /etc/os-release; then
+        log "ERROR" "Sistema operacional não homologado. Requer Ubuntu 22.04 LTS."
+        exit 1
+    fi
+    
+    # 2. Verificação de hardware
+    local cpu_cores=$(nproc)
+    local mem_gb=$(free -g | awk '/Mem:/ {print $2}')
+    local disk_count=$(lsblk -d -o NAME,RO,TYPE | awk '$2=="0" && $3=="disk" {print $1}' | wc -l)
+    
+    if [ "$cpu_cores" -lt 8 ] || [ "$mem_gb" -lt 16 ] || [ "$disk_count" -lt 2 ]; then
+        log "WARNING" "Hardware abaixo dos requisitos mínimos (8 cores, 16GB RAM, 2 discos)"
+        read -p "Deseja continuar mesmo assim? (s/n) " -n 1 -r
+        echo
+        [[ ! $REPLY =~ ^[Ss]$ ]] && exit 1
+    fi
+    
+    # 3. Verificação de rede
+    if ! ip a | grep -q '10G'; then
+        log "WARNING" "Nenhuma interface de rede 10Gbps detectada"
+    fi
+    
+    log "SUCCESS" "Verificação de ambiente concluída"
+}
+
+## Seção 2: Configuração do Sistema Base
+# ==============================================
+
+configure_base_system() {
+    log "INFO" "Iniciando configuração do sistema base"
+    
+    # 1. Atualização de segurança
+    log "INFO" "Executando atualizações de segurança"
+    apt-get update -qq
+    apt-get upgrade -y --only-upgrade security 2>&1 | tee -a "$AUDIT_TMP"
+    
+    # 2. Instalação de pacotes essenciais
+    declare -A REQUIRED_PKGS=(
+        ["glusterfs-server"]="9.2-1"
+        ["glusterfs-client"]="9.2-1"
+        ["xfsprogs"]="5.13.0-1"
+        ["attr"]="1:2.4.48-6"
+        ["socat"]="1.7.4.1-1"
+    )
+    
+    for pkg in "${!REQUIRED_PKGS[@]}"; do
+        log "INFO" "Instalando pacote: $pkg"
+        if ! apt-get install -y "$pkg=${REQUIRED_PKGS[$pkg]}" 2>&1 | tee -a "$AUDIT_TMP"; then
+            log "WARNING" "Falha ao instalar versão específica, tentando versão mais recente"
+            apt-get install -y "$pkg" 2>&1 | tee -a "$AUDIT_TMP"
+        fi
+        
+        if ! dpkg -l | grep -q "^ii  $pkg"; then
+            log "ERROR" "Falha crítica na instalação de $pkg"
+            exit 1
+        fi
+    done
+    
+    # 3. Configuração de parâmetros do kernel
+    log "INFO" "Configurando parâmetros do sistema"
+    cat > /etc/sysctl.d/90-gluster.conf << 'EOL'
+# Otimizações de rede
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# Otimizações para sistemas de arquivos
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+vm.swappiness = 10
+fs.aio-max-nr = 1048576
+EOL
+    
+    sysctl -p /etc/sysctl.d/90-gluster.conf 2>&1 | tee -a "$AUDIT_TMP"
+    
+    # 4. Configuração de limites do sistema
+    echo "glusterfs - nofile 65536" >> /etc/security/limits.conf
+    echo "root - nofile 65536" >> /etc/security/limits.conf
+    
+    log "SUCCESS" "Configuração do sistema base concluída"
+}
+
+## Seção 3: Configuração de Armazenamento
+# ==============================================
+
+setup_storage() {
+    log "INFO" "Iniciando configuração de armazenamento"
+    
+    # Menu de seleção de configuração
+    echo -e "\n\033[1mSelecione o modo de configuração de armazenamento:\033[0m"
+    echo "1) Configuração Automática (Recomendado)"
+    echo "2) Configuração Manual (Avançado)"
+    echo "3) Sair"
+    
+    while true; do
+        read -p "Opção [1]: " storage_choice
+        storage_choice=${storage_choice:-1}
+        
+        case $storage_choice in
+            1) auto_configure_storage; break;;
+            2) manual_configure_storage; break;;
+            3) exit 0;;
+            *) echo "Opção inválida, tente novamente.";;
+        esac
+    done
+    
+    log "SUCCESS" "Configuração de armazenamento concluída"
+}
+
+auto_configure_storage() {
+    log "INFO" "Iniciando configuração automática de armazenamento"
+    
+    # Identificação de discos disponíveis
+    local available_disks=($(lsblk -d -o NAME,RO,TYPE,MOUNTPOINT | awk '$2=="0" && $3=="disk" && $4=="" {print $1}'))
+    
+    if [ ${#available_disks[@]} -eq 0 ]; then
+        log "ERROR" "Nenhum disco disponível encontrado"
+        exit 1
+    fi
+    
+    log "INFO" "Discos disponíveis identificados: ${available_disks[*]}"
+    
+    # Configuração de cada disco
+    for disk in "${available_disks[@]}"; do
+        log "INFO" "Configurando disco /dev/$disk"
+        
+        # 1. Particionamento
+        if ! parted "/dev/$disk" mklabel gpt --script 2>&1 | tee -a "$AUDIT_TMP"; then
+            log "ERROR" "Falha ao criar tabela de partição em /dev/$disk"
+            continue
+        fi
+        
+        if ! parted -a optimal "/dev/$disk" mkpart primary 1MiB 100% --script 2>&1 | tee -a "$AUDIT_TMP"; then
+            log "ERROR" "Falha ao criar partição em /dev/$disk"
+            continue
+        fi
+        
+        # 2. Formatação
+        if ! mkfs.xfs -f -i size=512 -l size=128m -d su=64k,sw=4 "/dev/${disk}1" 2>&1 | tee -a "$AUDIT_TMP"; then
+            log "ERROR" "Falha ao formatar /dev/${disk}1"
+            continue
+        fi
+        
+        # 3. Montagem
+        local uuid=$(blkid -o value -s UUID "/dev/${disk}1")
+        local mount_point="/gluster/brick_${disk}"
+        
+        mkdir -p "$mount_point"
+        echo "UUID=$uuid $mount_point xfs rw,noatime,inode64,logbsize=256k 0 0" >> /etc/fstab
+        
+        if ! mount "$mount_point" 2>&1 | tee -a "$AUDIT_TMP"; then
+            log "ERROR" "Falha ao montar /dev/${disk}1 em $mount_point"
+            continue
+        fi
+        
+        # 4. Configuração do brick
+        mkdir -p "${mount_point}/brick"
+        chown -R glusterfs:glusterfs "$mount_point"
+        
+        log "INFO" "Disco /dev/$disk configurado com sucesso em $mount_point"
+    done
+}
+
+## Seção 4: Configuração de Rede
+# ==============================================
+
+configure_network() {
+    log "INFO" "Iniciando configuração de rede"
+    
+    # 1. Configuração de bonding
+    log "INFO" "Configurando agregação de links (bonding)"
+    
+    # Identificação de interfaces
+    local interfaces=($(ip -o link show | awk -F': ' '$2 !~ /lo|bond/ {print $2}'))
+    
+    if [ ${#interfaces[@]} -lt 2 ]; then
+        log "WARNING" "Menos de 2 interfaces de rede detectadas - bonding não será configurado"
+        return 1
+    fi
+    
+    # Configuração do Netplan
+    cat > /etc/netplan/01-gluster-net.yaml << EOL
+network:
+  version: 2
+  renderer: networkd
+  bonds:
+    bond0:
+      interfaces: [${interfaces[0]}, ${interfaces[1]}]
+      parameters:
+        mode: 802.3ad
+        lacp-rate: fast
+        mii-monitor-interval: 100
+        transmit-hash-policy: layer3+4
+  vlans:
+    bond0.100:
+      id: 100
+      addresses: [10.10.100.10/24]
+      mtu: 9000
+EOL
+    
+    if ! netplan apply 2>&1 | tee -a "$AUDIT_TMP"; then
+        log "ERROR" "Falha ao aplicar configuração de rede"
+        exit 1
+    fi
+    
+    # 2. Configuração de QoS
+    log "INFO" "Configurando QoS para tráfego Gluster"
+    tc qdisc add dev bond0 root handle 1: htb
+    tc class add dev bond0 parent 1: classid 1:1 htb rate 9Gbit ceil 10Gbit
+    tc class add dev bond0 parent 1:1 classid 1:10 htb rate 8Gbit ceil 9Gbit prio 0
+    tc filter add dev bond0 protocol ip parent 1:0 prio 1 u32 match ip dport 24007 0xffff flowid 1:10
+    
+    log "SUCCESS" "Configuração de rede concluída"
+}
+
+## Seção 5: Configuração do Cluster
+# ==============================================
+
+setup_cluster() {
+    log "INFO" "Iniciando configuração do cluster"
+    
+    echo -e "\n\033[1mSelecione o tipo de nó:\033[0m"
+    echo "1) Nó Primário (Inicia o cluster)"
+    echo "2) Nó Secundário (Adiciona ao cluster existente)"
+    echo "3) Nó Arbitro (Configuração mínima para quorum)"
+    echo "4) Sair"
+    
+    while true; do
+        read -p "Opção [1]: " node_type
+        node_type=${node_type:-1}
+        
+        case $node_type in
+            1) configure_primary_node; break;;
+            2) configure_secondary_node; break;;
+            3) configure_arbiter_node; break;;
+            4) exit 0;;
+            *) echo "Opção inválida, tente novamente.";;
+        esac
+    done
+    
+    log "SUCCESS" "Configuração do cluster concluída"
+}
+
+configure_primary_node() {
+    log "INFO" "Configurando nó primário do cluster"
+    
+    # 1. Coleta de informações
+    read -p "Digite o nome do cluster (ex: gluster-cluster): " cluster_name
+    read -p "Digite o IP do nó secundário: " secondary_ip
+    read -p "Digite o IP do nó arbitro: " arbiter_ip
+    
+    # Validação de IPs
+    if ! [[ $secondary_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! [[ $arbiter_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log "ERROR" "Endereços IP inválidos"
+        exit 1
+    fi
+    
+    # 2. Configuração de hosts
+    echo "$secondary_ip gluster-node2" >> /etc/hosts
+    echo "$arbiter_ip gluster-arbiter" >> /etc/hosts
+    
+    # 3. Inicialização do serviço Gluster
+    if ! systemctl enable --now glusterd 2>&1 | tee -a "$AUDIT_TMP"; then
+        log "ERROR" "Falha ao iniciar o serviço glusterd"
+        exit 1
+    fi
+    
+    # 4. Adição de nós ao cluster
+    log "INFO" "Adicionando nó secundário ao cluster"
+    if ! gluster peer probe gluster-node2 2>&1 | tee -a "$AUDIT_TMP"; then
+        log "ERROR" "Falha ao adicionar nó secundário"
+        exit 1
+    fi
+    
+    sleep 3
+    
+    log "INFO" "Adicionando nó arbitro ao cluster"
+    if ! gluster peer probe gluster-arbiter 2>&1 | tee -a "$AUDIT_TMP"; then
+        log "ERROR" "Falha ao adicionar nó arbitro"
+        exit 1
+    fi
+    
+    # 5. Criação do volume
+    local bricks=$(find /gluster -maxdepth 2 -name brick -type d | tr '\n' ' ')
+    
+    log "INFO" "Criando volume $cluster_name com bricks: $bricks"
+    if ! gluster volume create "$cluster_name" replica 3 arbiter 1 $bricks force 2>&1 | tee -a "$AUDIT_TMP"; then
+        log "ERROR" "Falha ao criar volume"
+        exit 1
+    fi
+    
+    # 6. Configurações de performance
+    gluster volume set "$cluster_name" performance.cache-size 2GB
+    gluster volume set "$cluster_name" performance.flush-behind off
+    gluster volume set "$cluster_name" performance.io-thread-count 16
+    gluster volume set "$cluster_name" cluster.quorum-type auto
+    
+    # 7. Inicialização do volume
+    if ! gluster volume start "$cluster_name" 2>&1 | tee -a "$AUDIT_TMP"; then
+        log "ERROR" "Falha ao iniciar volume"
+        exit 1
+    fi
+    
+    log "SUCCESS" "Nó primário configurado com sucesso"
+}
+
+## Seção 6: Hardening de Segurança
+# ==============================================
+
+harden_system() {
+    log "INFO" "Aplicando hardening de segurança"
+    
+    # 1. Configuração de firewall
+    log "INFO" "Configurando regras de firewall"
+    ufw allow from 10.10.100.0/24 to any port 24007:24008 proto tcp
+    ufw allow from 10.10.100.0/24 to any port 49152:49251 proto tcp
+    
+    if ufw status | grep -q inactive; then
+        ufw --force enable
+    fi
+    
+    # 2. Configuração de TLS
+    log "INFO" "Configurando certificados TLS"
+    openssl req -newkey rsa:4096 -nodes -keyout /etc/ssl/gluster.key \
+      -x509 -days 3650 -out /etc/ssl/gluster.pem \
+      -subj "/C=BR/ST=SP/L=Sao_Paulo/O=Enterprise/CN=gluster-cluster"
+    
+    chmod 600 /etc/ssl/gluster.key
+    chown root:glusterfs /etc/ssl/gluster.key
+    
+    # 3. Configuração de autenticação
+    gluster volume set all auth.ssl-allow gluster-node1,gluster-node2,gluster-arbiter
+    gluster volume set all client.ssl on
+    gluster volume set all server.ssl on
+    
+    # 4. ACLs para bricks
+    find /gluster -type d -name brick -exec setfacl -Rm u:gluster:rx {} \;
+    
+    log "SUCCESS" "Hardening de segurança aplicado"
+}
+
+## Seção 7: Monitoramento e Manutenção
+# ==============================================
+
+setup_monitoring() {
+    log "INFO" "Configurando monitoramento"
+    
+    # 1. Instalação do Telegraf
+    if ! apt-get install -y telegraf 2>&1 | tee -a "$AUDIT_TMP"; then
+        log "WARNING" "Falha ao instalar Telegraf"
+        return 1
+    fi
+    
+    # 2. Configuração do Telegraf
+    cat > /etc/telegraf/telegraf.conf << EOL
+[agent]
+  interval = "10s"
+  round_interval = true
+  metric_batch_size = 1000
+  metric_buffer_limit = 10000
+  collection_jitter = "0s"
+  flush_interval = "10s"
+  flush_jitter = "0s"
+  precision = ""
+  debug = false
+  quiet = false
+  logfile = ""
+  hostname = "$(hostname)"
+  omit_hostname = false
+
+[[inputs.gluster]]
+  endpoints = ["http://localhost:24007"]
+  timeout = "5s"
+
+[[outputs.influxdb]]
+  urls = ["http://monitoring-server:8086"]
+  database = "gluster_metrics"
+  retention_policy = ""
+  write_consistency = "any"
+  timeout = "5s"
+EOL
+    
+    # 3. Inicialização do serviço
+    systemctl restart telegraf
+    
+    if ! systemctl is-active --quiet telegraf; then
+        log "WARNING" "Telegraf não está em execução"
+    fi
+    
+    # 4. Configuração de log rotation
+    cat > /etc/logrotate.d/gluster << EOL
+/var/log/glusterfs/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    sharedscripts
+    postrotate
+        /usr/bin/killall -HUP glusterfs glusterd
+    endscript
+}
+EOL
+    
+    log "SUCCESS" "Monitoramento configurado"
+}
+
+## Seção 8: Finalização e Relatório
+# ==============================================
+
+generate_report() {
+    log "INFO" "Gerando relatório final"
+    
+    # 1. Informações do sistema
+    echo -e "\n\033[1m=== Relatório de Implementação ===\033[0m" | tee -a "$AUDIT_LOG"
+    echo "Data: $(date)" | tee -a "$AUDIT_LOG"
+    echo "Host: $(hostname)" | tee -a "$AUDIT_LOG"
+    echo "Sistema Operacional: $(lsb_release -d | cut -f2)" | tee -a "$AUDIT_LOG"
+    echo "Kernel: $(uname -r)" | tee -a "$AUDIT_LOG"
+    
+    # 2. Informações de hardware
+    echo -e "\n\033[1mHardware:\033[0m" | tee -a "$AUDIT_LOG"
+    echo "CPUs: $(nproc)" | tee -a "$AUDIT_LOG"
+    echo "Memória: $(free -h | awk '/Mem:/ {print $2}')" | tee -a "$AUDIT_LOG"
+    echo "Discos:" | tee -a "$AUDIT_LOG"
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE | tee -a "$AUDIT_LOG"
+    
+    # 3. Informações do cluster
+    echo -e "\n\033[1mStatus do Cluster:\033[0m" | tee -a "$AUDIT_LOG"
+    gluster peer status | tee -a "$AUDIT_LOG"
+    echo | tee -a "$AUDIT_LOG"
+    gluster volume info | tee -a "$AUDIT_LOG"
+    
+    # 4. Configurações de segurança
+    echo -e "\n\033[1mConfigurações de Segurança:\033[0m" | tee -a "$AUDIT_LOG"
+    ufw status verbose | tee -a "$AUDIT_LOG"
+    echo | tee -a "$AUDIT_LOG"
+    openssl x509 -in /etc/ssl/gluster.pem -noout -text | grep -A1 "Issuer:\|Subject:" | tee -a "$AUDIT_LOG"
+    
+    # 5. Configurações de performance
+    echo -e "\n\033[1mConfigurações de Performance:\033[0m" | tee -a "$AUDIT_LOG"
+    sysctl -a | grep -E "vm.dirty|net.core" | tee -a "$AUDIT_LOG"
+    
+    log "SUCCESS" "Relatório gerado em $AUDIT_LOG"
+}
+
+## Seção 9: Função Principal
+# ==============================================
+
+main() {
+    # Cabeçalho
+    echo -e "\n\033[1m=== GlusterFS Enterprise Deployment Suite ===\033[0m"
+    echo "Versão: 4.0"
+    echo "Data: $(date +"%Y-%m-%d %H:%M:%S")"
+    echo "Log de auditoria: $AUDIT_LOG"
+    
+    # Verificação de execução anterior
+    if [ -f /var/log/gluster_setup_complete ]; then
+        log "WARNING" "Este script já foi executado anteriormente neste sistema."
+        read -p "Deseja continuar mesmo assim? (s/n) " -n 1 -r
+        echo
+        [[ ! $REPLY =~ ^[Ss]$ ]] && exit 1
+    fi
+    
+    # Execução das etapas
+    verify_environment
+    configure_base_system
+    setup_storage
+    configure_network
+    setup_cluster
+    harden_system
+    setup_monitoring
+    
+    # Finalização
+    touch /var/log/gluster_setup_complete
+    chmod 600 "$AUDIT_LOG"
+    generate_report
+    
+    log "SUCCESS" "Implementação concluída com sucesso!"
+    echo -e "\n\033[1mPróximos passos:\033[0m"
+    echo "1. Verifique o relatório completo em $AUDIT_LOG"
+    echo "2. Configure o monitoramento no servidor InfluxDB"
+    echo "3. Documente as credenciais de acesso"
+    echo "4. Execute testes de validação do cluster"
+}
+
+# Início da execução
+main "$@"
